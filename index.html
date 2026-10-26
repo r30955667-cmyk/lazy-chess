@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Шахматный анализатор</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: #121212; color: #eee; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; padding: 10px; gap: 10px; }
+  #status { width: min(100%, 45vh); background: #222; border-radius: 10px; padding: 12px; text-align: center; font-size: 17px; min-height: 48px; }
+  #eval { font-weight: 700; color: #81c784; }
+  #boardWrap { position: relative; width: min(100%, 45vh); aspect-ratio: 1 / 1; container-type: inline-size; user-select: none; }
+  #board { display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); aspect-ratio: 1 / 1; width: 100%; border-radius: 4px; overflow: hidden; }
+  .sq { display: flex; align-items: center; justify-content: center; position: relative; font-size: 9.5cqw; line-height: 1; overflow: hidden; cursor: pointer; }
+  .light { background: #e8d9b5; }
+  .dark { background: #b58863; }
+  .sq.sel { background: #f6f669 !important; }
+  .sq.last { box-shadow: inset 0 0 0 100cqw rgba(255, 235, 59, 0.28); }
+  .sq.dot::after { content: ""; position: absolute; width: 28%; height: 28%; border-radius: 50%; background: rgba(0, 0, 0, 0.28); }
+  .sq.cap::after { content: ""; position: absolute; inset: 4%; border-radius: 50%; border: 0.9cqw solid rgba(0, 0, 0, 0.3); background: none; width: auto; height: auto; }
+  .p { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; font-family: "Segoe UI Symbol", "DejaVu Sans", "Noto Sans Symbols 2", "Apple Symbols", sans-serif; }
+  .p.w { color: #fff; text-shadow: 0 0 2px #000, 0 0 2px #000, 0 0 1px #000, 0 1px 1px #000; }
+  .p.b { color: #111; text-shadow: 0 0 1px rgba(255,255,255,.5); }
+  .coord { position: absolute; font-size: 2.6cqw; font-weight: 700; opacity: .65; pointer-events: none; font-family: sans-serif; }
+  .coord.f { right: 3%; bottom: 2%; }
+  .coord.r { left: 3%; top: 2%; }
+  .light .coord { color: #b58863; } .dark .coord { color: #e8d9b5; }
+  #arrow { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  #controls { width: min(100%, 45vh); display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  button { background: #222; color: #eee; border: 1px solid #3a3a3a; border-radius: 10px; padding: 16px 8px; font-size: 17px; cursor: pointer; }
+  button:active { background: #333; }
+  button.primary { grid-column: 1 / -1; background: #2e7d32; border-color: #388e3c; font-weight: 700; }
+  button:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+<div id="status">Загрузка…</div>
+<div id="boardWrap">
+  <div id="board"></div>
+  <svg id="arrow" viewBox="0 0 800 800" xmlns="http://www.w3.org/2000/svg"></svg>
+</div>
+<div id="controls">
+  <button id="btnFlip">За белых</button>
+  <button id="btnReset">Сброс</button>
+  <button id="btnUndo">Отмена хода</button>
+  <button id="btnAnalyze" class="primary">Анализ</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chess.js@0.10.3/chess.min.js"></script>
+<script>
+(function () {
+  var ENGINE_URL = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js';
+  var DEPTH = 15;
+  var GLYPH = { k: '\u265A', q: '\u265B', r: '\u265C', b: '\u265D', n: '\u265E', p: '\u265F' };
+
+  var boardEl = document.getElementById('board');
+  var arrowEl = document.getElementById('arrow');
+  var statusEl = document.getElementById('status');
+  var btnFlip = document.getElementById('btnFlip');
+  var btnAnalyze = document.getElementById('btnAnalyze');
+
+  var game = null;
+  var flipped = false;      // false = белые снизу
+  var selected = null;
+  var legalTargets = [];
+  var lastMove = null;
+  var bestMove = null;
+  var analyzing = false;
+
+  var worker = null, engineReady = false, engineFailed = false, pendingGo = null;
+  var lastScoreText = '', analysisToken = 0;
+
+  function setStatus(html) { statusEl.innerHTML = html; }
+
+  /* ---------- Движок ---------- */
+  var mainEngine = null;
+  function send(cmd) {
+    if (worker) worker.postMessage(cmd);
+    else if (mainEngine) mainEngine.onCustomMessage(cmd);
+  }
+
+  function initEngine() {
+    // 1) Пробуем Web Worker (cross-origin скрипт оборачиваем в Blob).
+    var wasm = ENGINE_URL.replace(/\.js$/, '.wasm');
+    try {
+      var code = 'importScripts(' + JSON.stringify(ENGINE_URL) + ');';
+      var blobUrl = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+      worker = new Worker(blobUrl + '#' + encodeURIComponent(wasm) + ',worker');
+      worker.onmessage = onEngineMessage;
+      worker.onerror = function (e) {
+        if (!engineReady) { worker = null; initMainThread(wasm); }
+        else engineFail(e);
+      };
+      send('uci');
+    } catch (e) {
+      // 2) Песочница запретила Worker — запускаем движок в основном потоке.
+      worker = null;
+      initMainThread(wasm);
+    }
+  }
+
+  function initMainThread(wasm) {
+    var sc = document.createElement('script');
+    sc.src = ENGINE_URL;
+    sc.onerror = function () { engineFail('не удалось загрузить скрипт движка'); };
+    sc.onload = function () {
+      var factory = sc._exports;
+      if (typeof factory !== 'function') { engineFail('движок не инициализировался'); return; }
+      factory({ locateFile: function (f) { return f.indexOf('.wasm') > -1 ? wasm : f; } })
+        .then(function (eng) {
+          mainEngine = eng;
+          eng.addMessageListener(function (line) { onEngineMessage({ data: line }); });
+          send('uci');
+        })
+        .catch(engineFail);
+    };
+    document.head.appendChild(sc);
+    setTimeout(function () {
+      if (!engineReady && !engineFailed) engineFail('таймаут: движок не ответил за 30 секунд');
+    }, 30000);
+  }
+
+  function engineFail(e) {
+    engineFailed = true; engineReady = false;
+    analyzing = false; btnAnalyze.disabled = false;
+    console.warn('Engine error', e);
+    var msg = (e && (e.message || e.toString())) || '';
+    setStatus('Не удалось запустить движок Stockfish.<br><small>' + msg + '</small>');
+  }
+
+  function onEngineMessage(ev) {
+    var line = typeof ev.data === 'string' ? ev.data : (ev.data && ev.data.data) || '';
+    if (!line) return;
+
+    if (line === 'uciok') { send('isready'); return; }
+    if (line === 'readyok') {
+      if (!engineReady) {
+        engineReady = true;
+        updateStatus();
+        if (pendingGo) { var p = pendingGo; pendingGo = null; startSearch(p); }
+      }
+      return;
+    }
+    if (line.indexOf('info') === 0 && line.indexOf(' score ') > -1) {
+      var m = line.match(/score (cp|mate) (-?\d+)/);
+      if (m && !/(lowerbound|upperbound)/.test(line)) {
+        var turn = game.turn();
+        var v = parseInt(m[2], 10);
+        if (m[1] === 'cp') {
+          var w = turn === 'w' ? v : -v;            // с точки зрения белых
+          lastScoreText = (w > 0 ? '+' : '') + (w / 100).toFixed(2);
+        } else {
+          var n = Math.abs(v);
+          var winner = (v > 0) === (turn === 'w') ? 'белые' : 'чёрные';
+          lastScoreText = 'Мат в ' + n + ' (' + winner + ')';
+        }
+      }
+      return;
+    }
+    if (line.indexOf('bestmove') === 0) {
+      var bm = line.split(' ')[1];
+      analyzing = false; btnAnalyze.disabled = false;
+      if (!bm || bm === '(none)') { setStatus('Нет ходов.'); return; }
+      bestMove = { from: bm.slice(0, 2), to: bm.slice(2, 4) };
+      drawArrow();
+      var san = '';
+      try {
+        var tmp = new Chess(game.fen());
+        var mv = tmp.move({ from: bestMove.from, to: bestMove.to, promotion: bm[4] || 'q' });
+        if (mv) san = mv.san;
+      } catch (e) {}
+      setStatus('Лучший ход: <b>' + bm + '</b>' + (san ? ' (' + san + ')' : '') +
+        '<br>Оценка: <span id="eval">' + (lastScoreText || '—') + '</span>' +
+        '<br><small>(с точки зрения белых, глубина ' + DEPTH + ')</small>');
+    }
+  }
+
+  function startSearch(fen) {
+    lastScoreText = '';
+    setTimeout(function () {
+      send('position fen ' + fen);
+      send('go depth ' + DEPTH);
+    }, 60);
+  }
+
+  function analyze() {
+    if (game.game_over()) { updateStatus(); return; }
+    if (engineFailed) { setStatus('Движок недоступен.'); return; }
+    if (analyzing) return;
+    analyzing = true; btnAnalyze.disabled = true;
+    clearArrow();
+    setStatus('Считаю лучший ход...');
+    var fen = game.fen();
+    if (!engineReady) { pendingGo = fen; return; }
+    startSearch(fen);
+  }
+
+  function cancelAnalysis() {
+    if (analyzing && engineReady) {
+      pendingGo = null;
+      send('stop');
+      // bestmove от остановленного поиска придёт позже — игнорируем через флаг
+      analysisToken++;
+    }
+    pendingGo = null;
+    analyzing = false; btnAnalyze.disabled = false;
+  }
+
+  /* ---------- Доска ---------- */
+  function sqName(file, rank) { return 'abcdefgh'[file] + (rank + 1); }
+
+  function render() {
+    boardEl.innerHTML = '';
+    var pos = {};
+    var b = game.board();
+    for (var r = 0; r < 8; r++) for (var f = 0; f < 8; f++) {
+      var p = b[r][f];
+      if (p) pos[sqName(f, 7 - r)] = p;
+    }
+    for (var row = 0; row < 8; row++) {
+      for (var col = 0; col < 8; col++) {
+        var file = flipped ? 7 - col : col;
+        var rank = flipped ? row : 7 - row;
+        var name = sqName(file, rank);
+        var d = document.createElement('div');
+        d.className = 'sq ' + (((file + rank) % 2 === 0) ? 'dark' : 'light');
+        d.dataset.sq = name;
+        if (selected === name) d.classList.add('sel');
+        if (lastMove && (lastMove.from === name || lastMove.to === name)) d.classList.add('last');
+        if (legalTargets.indexOf(name) > -1) d.classList.add(pos[name] ? 'cap' : 'dot');
+        if (pos[name]) {
+          var s = document.createElement('span');
+          s.className = 'p ' + pos[name].color;
+          s.textContent = GLYPH[pos[name].type] + '\uFE0E';
+          d.appendChild(s);
+        }
+        if (col === 0) { var cr = document.createElement('span'); cr.className = 'coord r'; cr.textContent = rank + 1; d.appendChild(cr); }
+        if (row === 7) { var cf = document.createElement('span'); cf.className = 'coord f'; cf.textContent = 'abcdefgh'[file]; d.appendChild(cf); }
+        d.addEventListener('click', onSquareClick);
+        boardEl.appendChild(d);
+      }
+    }
+    drawArrow();
+  }
+
+  function onSquareClick(e) {
+    var sq = e.currentTarget.dataset.sq;
+    if (game.game_over()) return;
+    var piece = game.get(sq);
+
+    if (selected && legalTargets.indexOf(sq) > -1) {
+      var mv = game.move({ from: selected, to: sq, promotion: 'q' });
+      if (mv) {
+        cancelAnalysis();
+        lastMove = { from: mv.from, to: mv.to };
+        selected = null; legalTargets = []; bestMove = null;
+        render(); updateStatus();
+        return;
+      }
+    }
+    if (piece && piece.color === game.turn() && selected !== sq) {
+      selected = sq;
+      legalTargets = game.moves({ square: sq, verbose: true }).map(function (m) { return m.to; });
+    } else {
+      selected = null; legalTargets = [];
+    }
+    render();
+  }
+
+  /* ---------- Стрелка ---------- */
+  function center(sq) {
+    var file = sq.charCodeAt(0) - 97;
+    var rank = parseInt(sq[1], 10) - 1;
+    var col = flipped ? 7 - file : file;
+    var row = flipped ? rank : 7 - rank;
+    return { x: col * 100 + 50, y: row * 100 + 50 };
+  }
+  function clearArrow() { arrowEl.innerHTML = ''; bestMove = null; }
+  function drawArrow() {
+    arrowEl.innerHTML = '';
+    if (!bestMove) return;
+    var a = center(bestMove.from), z = center(bestMove.to);
+    var color = 'rgba(76, 175, 80, 0.9)';
+    var ns = 'http://www.w3.org/2000/svg';
+    var line = document.createElementNS(ns, 'line');
+    line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+    line.setAttribute('x2', z.x); line.setAttribute('y2', z.y);
+    line.setAttribute('stroke', color); line.setAttribute('stroke-width', 16);
+    line.setAttribute('stroke-linecap', 'round');
+    var start = document.createElementNS(ns, 'circle');
+    start.setAttribute('cx', a.x); start.setAttribute('cy', a.y); start.setAttribute('r', 10);
+    start.setAttribute('fill', color);
+    var end = document.createElementNS(ns, 'circle');
+    end.setAttribute('cx', z.x); end.setAttribute('cy', z.y); end.setAttribute('r', 28);
+    end.setAttribute('fill', color);
+    arrowEl.appendChild(line); arrowEl.appendChild(start); arrowEl.appendChild(end);
+  }
+
+  /* ---------- Статус и кнопки ---------- */
+  function updateStatus() {
+    if (analyzing) return;
+    var t = game.turn() === 'w' ? 'белых' : 'чёрных';
+    if (game.in_checkmate()) { setStatus('Мат! Победили ' + (game.turn() === 'w' ? 'чёрные' : 'белые') + '.'); return; }
+    if (game.in_draw() || game.in_stalemate()) { setStatus('Ничья.'); return; }
+    if (!engineReady && !engineFailed) { setStatus('Загрузка движка… Ход ' + t + (game.in_check() ? ' (шах!)' : '')); return; }
+    setStatus('Твой ход — ход ' + t + (game.in_check() ? ' (шах!)' : ''));
+  }
+
+  btnFlip.addEventListener('click', function () {
+    flipped = !flipped;
+    btnFlip.textContent = flipped ? 'За чёрных' : 'За белых';
+    render();
+  });
+  document.getElementById('btnReset').addEventListener('click', function () {
+    cancelAnalysis();
+    game = new Chess(); selected = null; legalTargets = []; lastMove = null; bestMove = null;
+    if (engineReady) send('ucinewgame');
+    render(); updateStatus();
+  });
+  document.getElementById('btnUndo').addEventListener('click', function () {
+    cancelAnalysis();
+    game.undo(); selected = null; legalTargets = []; bestMove = null;
+    var h = game.history({ verbose: true });
+    lastMove = h.length ? { from: h[h.length - 1].from, to: h[h.length - 1].to } : null;
+    render(); updateStatus();
+  });
+  btnAnalyze.addEventListener('click', analyze);
+
+  /* ---------- Старт ---------- */
+  if (typeof Chess === 'undefined') {
+    setStatus('Не удалось загрузить chess.js (нужен интернет).');
+    return;
+  }
+  game = new Chess();
+  render();
+  updateStatus();
+  initEngine();
+})();
+</script>
+</body>
+</html>
