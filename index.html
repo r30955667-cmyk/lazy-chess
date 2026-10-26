@@ -52,6 +52,8 @@
 (function () {
   var ENGINE_URL = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js';
   var DEPTH = 15;
+  var MOVETIME = 10000; // страховка: максимум 10 сек на ход (на слабых телефонах)
+  var engineMode = '';
   var GLYPH = { k: '\u265A', q: '\u265B', r: '\u265C', b: '\u265D', n: '\u265E', p: '\u265F' };
 
   var boardEl = document.getElementById('board');
@@ -92,7 +94,11 @@
         if (!engineReady) { worker = null; initMainThread(wasm); }
         else engineFail(e);
       };
+      engineMode = 'worker';
       send('uci');
+      setTimeout(function () {
+        if (!engineReady && worker) { try { worker.terminate(); } catch (e) {} worker = null; initMainThread(wasm); }
+      }, 8000);
     } catch (e) {
       // 2) Песочница запретила Worker — запускаем движок в основном потоке.
       worker = null;
@@ -101,6 +107,7 @@
   }
 
   function initMainThread(wasm) {
+    engineMode = 'main';
     var sc = document.createElement('script');
     sc.src = ENGINE_URL;
     sc.onerror = function () { engineFail('не удалось загрузить скрипт движка'); };
@@ -142,6 +149,10 @@
       }
       return;
     }
+    if (analyzing && line.indexOf('info depth') === 0) {
+      var dm = line.match(/depth (\d+)/);
+      if (dm) setStatus('Считаю лучший ход... глубина ' + dm[1] + '/' + DEPTH);
+    }
     if (line.indexOf('info') === 0 && line.indexOf(' score ') > -1) {
       var m = line.match(/score (cp|mate) (-?\d+)/);
       if (m && !/(lowerbound|upperbound)/.test(line)) {
@@ -180,7 +191,7 @@
     lastScoreText = '';
     setTimeout(function () {
       send('position fen ' + fen);
-      send('go depth ' + DEPTH);
+      send('go depth ' + DEPTH + ' movetime ' + MOVETIME);
     }, 60);
   }
 
@@ -192,6 +203,13 @@
     clearArrow();
     setStatus('Считаю лучший ход...');
     var fen = game.fen();
+    var myToken = ++analysisToken;
+    setTimeout(function () {
+      if (analyzing && myToken === analysisToken) {
+        analyzing = false; btnAnalyze.disabled = false;
+        setStatus('Движок не ответил (режим: ' + (engineMode || '?') + ', готов: ' + engineReady + '). Нажмите «Анализ» ещё раз.');
+      }
+    }, 40000);
     if (!engineReady) { pendingGo = fen; return; }
     startSearch(fen);
   }
@@ -340,3 +358,4 @@
 </script>
 </body>
 </html>
+
